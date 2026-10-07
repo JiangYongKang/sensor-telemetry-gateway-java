@@ -45,6 +45,14 @@ public class AggregationService {
         long lower = at - properties.getWindowMillis();
         List<Double> values = new ArrayList<>();
         synchronized (state) {
+            // 查询窗口涉及已被容量策略淘汰的样本时，静默计算会得到偏小的假结果，
+            // 必须明确告知调用方该区间已超出保留范围。
+            if (state.windowEvictedUpTo() >= 0 && lower < state.windowEvictedUpTo()) {
+                throw new GatewayException(RejectionReason.OUT_OF_RETENTION,
+                        "设备 '" + deviceId + "' 的窗口查询下界 " + lower
+                                + " 已超出保留范围（最旧可用事件时间 > "
+                                + state.windowEvictedUpTo() + "），结果不可用");
+            }
             for (AcceptedSample sample : state.window()) {
                 if (sample.eventTime() > lower && sample.eventTime() <= at) {
                     for (CanonicalReading reading : sample.readings()) {
@@ -68,11 +76,16 @@ public class AggregationService {
         return new WindowStats(type, values.size(), min, max, sum / values.size());
     }
 
-    /** 基于最后一次有效上报的事件时间判定离线，规则固定且可复现。 */
+    /**
+     * 在线判定口径：以“最近一次被接受上报的接收时间”为准，
+     * at - lastValidIngestTime <= offlineMillis 即在线（闭区间）。
+     * 乱序/滞后上报只要被接受就刷新该时间，事件时间再旧也不会误判离线；
+     * 被拒绝的上报不会更新它。同一判定时刻反复查询结论一致、可复现。
+     */
     public boolean isOnline(DeviceState state, long atMillis) {
         long last;
         synchronized (state) {
-            last = state.lastValidEventTime();
+            last = state.lastValidIngestTime();
         }
         return last >= 0 && (atMillis - last) <= properties.getOfflineMillis();
     }

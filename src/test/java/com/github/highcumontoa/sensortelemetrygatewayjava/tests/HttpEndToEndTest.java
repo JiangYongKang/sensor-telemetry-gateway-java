@@ -29,12 +29,33 @@ class HttpEndToEndTest {
     @Autowired
     private MockMvc mvc;
 
+    @Autowired
+    private Clock clock;
+
     @TestConfiguration
     static class FixedClockConfig {
         @Bean
         @Primary
         Clock fixedClock() {
-            return () -> 10_000_000L;
+            return new MutableClock(10_000_000L);
+        }
+    }
+
+    /** 可推进的测试时钟：可用性/概览查询需要注册之后的一段时间区间。 */
+    static final class MutableClock implements Clock {
+        private long now;
+
+        MutableClock(long start) {
+            this.now = start;
+        }
+
+        @Override
+        public long nowMillis() {
+            return now;
+        }
+
+        void set(long value) {
+            this.now = value;
         }
     }
 
@@ -99,11 +120,12 @@ class HttpEndToEndTest {
                 .andExpect(jsonPath("$[0].accepted").value(true))
                 .andExpect(jsonPath("$[1].rejectionReason").value("VALUE_OUT_OF_RANGE"));
 
-        // 状态：最后有效事件时间为 9992000，距固定时钟 10000000 为 8s => ONLINE。
+        // 状态：最后有效事件时间为 9992000，接收时间为固定时钟 10000000 => ONLINE。
         mvc.perform(get("/api/devices/th-1/status"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("ONLINE"))
                 .andExpect(jsonPath("$.lastValidEventTime").value(9992000))
+                .andExpect(jsonPath("$.lastValidIngestTime").value(10000000))
                 .andExpect(jsonPath("$.latest.TEMPERATURE.value").value(30.0));
 
         // 聚合：温度窗口内仅 1 个有效值（30C）。
@@ -111,6 +133,32 @@ class HttpEndToEndTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.count").value(1))
                 .andExpect(jsonPath("$.avg").value(30.0));
+
+        // 可用性：注册于 10000000 且此后有有效上报；时钟推进 10s 后查询该区间 => 全程在线。
+        ((MutableClock) clock).set(10_010_000L);
+        mvc.perform(get("/api/devices/th-1/availability")
+                        .param("from", "10000000").param("to", "10010000"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.onlineMillis").value(10000))
+                .andExpect(jsonPath("$.onlineRatio").value(1.0))
+                .andExpect(jsonPath("$.offlinePeriods.length()").value(0));
+
+        // 可用性：查询起点早于注册时刻（保留历史下界）=> 明确报 OUT_OF_RETENTION。
+        mvc.perform(get("/api/devices/th-1/availability")
+                        .param("from", "1000").param("to", "10010000"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.rejectionReason").value("OUT_OF_RETENTION"));
+
+        // 机群概览：1 台设备在线，计数与逐台状态自洽。
+        mvc.perform(get("/api/fleet/overview"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.evaluatedAt").value(10010000))
+                .andExpect(jsonPath("$.totalDevices").value(1))
+                .andExpect(jsonPath("$.onlineCount").value(1))
+                .andExpect(jsonPath("$.offlineCount").value(0))
+                .andExpect(jsonPath("$.devices[0].deviceId").value("th-1"))
+                .andExpect(jsonPath("$.devices[0].status").value("ONLINE"))
+                .andExpect(jsonPath("$.devices[0].lastValidIngestTime").value(10000000));
 
         // 未注册设备查询：404。
         mvc.perform(get("/api/devices/nobody/status"))

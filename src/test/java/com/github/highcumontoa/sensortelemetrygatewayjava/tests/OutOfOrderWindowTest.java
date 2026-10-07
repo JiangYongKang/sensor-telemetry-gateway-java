@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * 乱序与迟到处理：聚合按事件时间过滤，与到达顺序无关；
- * 迟到样本计入窗口但不使最新值回退；离线判定基于最后有效事件时间。
+ * 迟到样本计入窗口但不使最新值回退；离线判定基于最后一次有效上报的接收时间。
  */
 class OutOfOrderWindowTest {
 
@@ -90,14 +90,14 @@ class OutOfOrderWindowTest {
     }
 
     @Test
-    void offlineIsDeterminedByLastValidEventTime() {
+    void offlineIsDeterminedByLastValidIngestTime() {
         sendV1(T0, T0, 0.0);
         harness.clock().set(T0 + 30_000);
         boolean atBoundary = harness.aggregation().isOnline(harness.registry().find("dev"), T0 + 30_000);
         harness.clock().set(T0 + 30_001);
         boolean pastThreshold = harness.aggregation().isOnline(harness.registry().find("dev"), T0 + 30_001);
-        log.info("输入: 最后有效事件时间=10000000，离线阈值 30000ms；"
-                + "判定依据: at-last<=30000 在线（闭区间），之后离线");
+        log.info("输入: 最后有效上报接收于 {}，离线阈值 30000ms；"
+                + "判定依据: at-lastValidIngestTime<=30000 在线（闭区间），之后离线", T0);
         assertTrue(atBoundary, "恰好 30s 边界仍在线");
         assertFalse(pastThreshold, "超过 30s 即离线");
 
@@ -113,9 +113,12 @@ class OutOfOrderWindowTest {
                 List.of(new ReadingDto("TEMPERATURE", 999.0, "C")));
         IngestResult rejected = harness.telemetry().ingest(bad);
         assertFalse(rejected.accepted());
-        long last = harness.registry().find("dev").lastValidEventTime();
-        log.info("输入: {}；判定依据: 越界上报不改变最后有效事件时间，仍为 {}", bad, T0);
-        assertEquals(T0, last);
+        DeviceState state = harness.registry().find("dev");
+        long lastEvent = state.lastValidEventTime();
+        long lastIngest = state.lastValidIngestTime();
+        log.info("输入: {}；判定依据: 越界上报不改变最后有效事件时间/接收时间，仍为 {}", bad, T0);
+        assertEquals(T0, lastEvent);
+        assertEquals(T0, lastIngest);
     }
 
     private void sendV1(long eventTime, long arriveAt, double value) {

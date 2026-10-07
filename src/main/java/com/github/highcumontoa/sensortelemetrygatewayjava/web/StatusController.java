@@ -46,7 +46,7 @@ public class StatusController {
                         "eventTime", state.latestEventTime().get(entry.getKey())));
             }
             return new StatusResponse(deviceId, online ? "ONLINE" : "OFFLINE",
-                    state.lastValidEventTime(), at, latest);
+                    state.lastValidEventTime(), state.lastValidIngestTime(), at, latest);
         }
     }
 

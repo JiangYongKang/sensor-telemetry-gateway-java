@@ -12,8 +12,10 @@
 | POST | `/api/devices` | 注册设备（幂等），声明协议版本与能力集合 |
 | POST | `/api/telemetry` | 单条上报，请求体为一个上报 JSON 对象 |
 | POST | `/api/telemetry/batch` | 批量上报，请求体为上报对象的 JSON 数组 |
-| GET  | `/api/devices/{id}/status` | 在线状态、最后有效事件时间、各传感器最新值 |
+| GET  | `/api/devices/{id}/status` | 在线状态、最后有效事件/接收时间、各传感器最新值 |
 | GET  | `/api/devices/{id}/stats?type=TEMPERATURE&at=<epochMillis>` | 指定时刻的滑动窗口聚合（`at` 缺省为当前时间） |
+| GET  | `/api/devices/{id}/availability?from=<epochMillis>&to=<epochMillis>` | 可用性统计：累计在线时长、在线占比、掉线时间段 |
+| GET  | `/api/fleet/overview` | 机群级在线概览：在线/离线台数与每台设备最近有效上报时间 |
 
 注册请求示例：
 
@@ -54,6 +56,8 @@
 | `VALUE_OUT_OF_RANGE` | 422 | 换算到标准单位后超出量程闭区间 |
 | `FUTURE_TIMESTAMP` | 422 | 事件时间超过接收时间 `gateway.max-future-millis` |
 | `DUPLICATE_SEQUENCE` | 409 | V2 显式序列号在窗口内重复 |
+| `INVALID_TIME_RANGE` | 422 | 可用性查询 `from >= to`，或区间完全落在当前时刻之后 |
+| `OUT_OF_RETENTION` | 422 | 查询涉及已被容量/保留策略淘汰的数据，结果不可用（见第 5 节） |
 
 拒绝遵循固定优先级（设备存在 → 版本匹配 → 时间合法 →
 逐条“字段缺失 → 类型未知 → 能力未声明 → 单位非法 → 量程越界”），
@@ -122,24 +126,71 @@ gateway.offline-millis=30000     # 离线阈值
 - 窗口为基于**事件时间**的左开右闭区间 `(at - windowMillis, at]`，
   统计 `count/min/max/avg`（平均值基于标准单位值）。窗口内无样本时
   返回 `count=0` 且 min/max/avg 为 null。
-- 离线判定：`at - lastValidEventTime <= offlineMillis` 为 `ONLINE`，否则 `OFFLINE`
-  （闭区间，恰好 30 秒仍在线）。`lastValidEventTime` 只在上报被**接受**后更新，
-  被拒绝的上报不影响在线结论；同一判定时刻反复查询结论一致、可复现。
+- **离线判定口径：以“最近一次被接受上报的接收时间”为准**——
+  `at - lastValidIngestTime <= offlineMillis` 为 `ONLINE`（闭区间，恰好 30 秒仍在线）。
+  乱序、滞后上报只要被成功接受，就按接收时间刷新在线状态，
+  **哪怕它携带的事件时间比实际收到时间早很多，也不会被误判离线**；
+  只有长时间没有任何有效上报才算离线。`lastValidIngestTime` 只在上报被
+  **接受**后更新，被拒绝的上报不影响在线结论；同一判定时刻反复查询结论一致、可复现。
 - 并发安全：每台设备一把锁，序列号去重、窗口插入、最新值更新、
   最后有效时间更新在同一临界区原子完成，配合事件时间有序插入，
   保证并发写入不丢数、不重复计数、窗口结果不回退，
   且并发聚合结果与同样输入串行执行**逐值相等**（见并发一致性测试）。
 
-## 5. 验证方法
+## 5. 设备可用性统计与机群在线概览
+
+### 可用性统计 `GET /api/devices/{id}/availability?from=&to=`
+
+- 判定口径与单台设备在线状态**完全一致**：每次有效上报被接受时，
+  按接收时间生成在线区间 `[ingestTime, ingestTime + offlineMillis]` 并增量合并；
+  查询只是把查询区间投影到这些在线区间上。
+- 返回 `onlineMillis`（累计在线时长）、`onlineRatio`（在线占比）、
+  `offlinePeriods`（掉线时间段列表，每段 `[from, to]` 表示两次在线区间之间的空档）。
+  恒有 `onlineMillis + Σ掉线时长 = to - from`，不会重复或丢数。
+- `to` 超过当前时刻时截断到当前时刻；**同一区间反复查询结果逐值相同**。
+- `from` 早于已保留历史的下界（见第 6 节保留策略）时返回 422 `OUT_OF_RETENTION`，
+  明确告知结果不可用，绝不静默给出看似正常实则偏差的数字。
+
+### 机群在线概览 `GET /api/fleet/overview`
+
+- 一次返回 `totalDevices/onlineCount/offlineCount` 与每台设备的
+  `status`、`lastValidIngestTime`（最近一次有效上报的接收时间）、`lastValidEventTime`。
+- 所有设备共用同一个判定时刻 `evaluatedAt`，每台设备的状态与最近上报时间
+  在同一临界区读取，因此与上报并发时结果也**自洽**——不会出现
+  “被判离线却又显示一个很新的最近上报时间”这类矛盾；
+  恒有 `onlineCount + offlineCount = totalDevices`。
+- 只按设备逐个短暂持锁、无全局锁，设备增多不会明显拖慢上报路径。
+
+## 6. 容量与保留策略
+
+长期运行时各类状态都有明确且可配置的上限，内存占用有界：
+
+```properties
+gateway.max-window-samples=10000          # 每台设备窗口样本条数上限，超出淘汰最旧样本
+gateway.max-seen-sequences=100000         # 每台设备序列号去重状态上限，超出淘汰最旧序列号
+gateway.availability-retention-millis=86400000  # 可用性在线区间历史保留时长（默认 24h）
+gateway.max-raw-reports=100000            # 原始报文留档全局上限，超出淘汰最旧记录
+```
+
+- 窗口样本同时受 `window-millis`（按事件时间）与 `max-window-samples`（按条数）约束。
+- 所有淘汰都在设备写入锁内完成，只移除旧数据：**不触碰当前在线结论**
+  （在线状态由 `lastValidIngestTime` 决定，永不淘汰），因此不会造成
+  计数重复、丢数或在线状态来回抖动。
+- 超出保留范围的数据不再作为有效依据：窗口聚合查询若涉及已被淘汰的样本，
+  返回 422 `OUT_OF_RETENTION`；可用性查询起点早于保留下界时同样返回
+  `OUT_OF_RETENTION`。保留范围内的查询结果确定、可复现。
+
+## 7. 验证方法
 
 沿用仓库既有技术栈（JUnit 5 + Spring Boot Test + MockMvc），无外部依赖。
 
 ```bash
-mvn test            # 离线运行全部 38 个测试用例
+mvn test            # 离线运行全部 50 个测试用例
 ```
 
 测试均通过可注入的 `ManualClock` 固定/推进时间，单测日志会打印
-**输入报文与判定依据**（见 `ReportEvaluator`/`TelemetryService` 及各测试的日志输出）。
+**输入报文与判定依据**（见 `ReportEvaluator`/`TelemetryService`/`AvailabilityService`
+及各测试的日志输出）。
 
 覆盖场景：
 
@@ -152,20 +203,30 @@ mvn test            # 离线运行全部 38 个测试用例
   V2 缺省序列号不去重、时间戳缺省补接收时间。
 - `OutOfOrderWindowTest`：乱序到达与串行同结果、窗口边界排除、
   迟到计入但不回退最新值、离线边界与恢复、拒绝不改变最后有效时间。
+- `AvailabilityTest`：可用性时长/占比/掉线时段计算、同一区间反复查询结果一致、
+  滞后上报保持在线、被拒绝上报不改变可用性、超出保留范围明确报
+  `OUT_OF_RETENTION`、非法区间与未注册设备的可区分拒绝。
+- `FleetOverviewTest`：机群概览计数与逐台状态自洽、与单台设备状态口径一致；
+  8 线程并发上报 + 4 线程并发查询下任何一次结果内部都不矛盾。
+- `RetentionCapacityTest`：窗口条数上限、序列号去重上限、原始留档上限的
+  淘汰行为；淘汰后在线状态不抖动；涉及已淘汰范围的窗口查询明确报
+  `OUT_OF_RETENTION`。
 - `ConcurrencyConsistencyTest`：200 条样本 8 线程并发，聚合与串行逐值相等；
   16 线程竞争同一序列号恰好接受一次。
 - `EntryPointConsistencyTest`：单条入口与批量入口同输入同结论、同拒绝原因。
-- `HttpEndToEndTest`：经真实 HTTP 栈走查注册/上报/拒绝/状态/聚合全链路。
+- `HttpEndToEndTest`：经真实 HTTP 栈走查注册/上报/拒绝/状态/聚合/
+  可用性/机群概览全链路。
 
-## 6. 代码结构
+## 8. 代码结构
 
 ```
 clock/      可注入时钟（SystemClock 生产实现，ManualClock 测试用）
 model/      枚举、记录类型与 SensorCatalog（单位/量程事实来源）
-config/     GatewayProperties（窗口与离线参数）
-registry/   DeviceRegistry（线程安全注册表、状态原子写入）
-store/      RawReportStore（原始报文留档）
+config/     GatewayProperties（窗口、离线与容量/保留参数）
+registry/   DeviceRegistry（线程安全注册表、状态原子写入、容量淘汰）
+store/      RawReportStore（原始报文留档，容量有界）
 ingest/     ProtocolSupport（版本映射）、ReportEvaluator（校验规范化管线）、异常
-service/    DeviceService、TelemetryService、AggregationService
+service/    DeviceService、TelemetryService、AggregationService、
+            AvailabilityService（可用性统计）、FleetService（机群概览）
 web/        REST 控制器、DTO、全局异常映射
 ```
