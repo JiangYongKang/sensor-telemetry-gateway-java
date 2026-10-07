@@ -7,6 +7,7 @@ import com.github.highcumontoa.sensortelemetrygatewayjava.ingest.ReportEvaluator
 import com.github.highcumontoa.sensortelemetrygatewayjava.model.SensorCatalog;
 import com.github.highcumontoa.sensortelemetrygatewayjava.registry.DeviceRegistry;
 import com.github.highcumontoa.sensortelemetrygatewayjava.service.AggregationService;
+import com.github.highcumontoa.sensortelemetrygatewayjava.service.AvailabilityService;
 import com.github.highcumontoa.sensortelemetrygatewayjava.service.DeviceService;
 import com.github.highcumontoa.sensortelemetrygatewayjava.service.TelemetryService;
 import com.github.highcumontoa.sensortelemetrygatewayjava.store.RawReportStore;
@@ -21,6 +22,7 @@ public record Harness(
         DeviceService devices,
         TelemetryService telemetry,
         AggregationService aggregation,
+        AvailabilityService availability,
         ObjectMapper mapper
 ) {
     public static Harness create() {
@@ -29,14 +31,16 @@ public record Harness(
         SensorCatalog catalog = new SensorCatalog();
         ProtocolSupport protocolSupport = new ProtocolSupport();
         DeviceRegistry registry = new DeviceRegistry(clock, props);
-        RawReportStore rawStore = new RawReportStore();
+        RawReportStore rawStore = new RawReportStore(props);
         ReportEvaluator evaluator = new ReportEvaluator(registry, catalog, protocolSupport, props);
         ObjectMapper mapper = new ObjectMapper();
         TelemetryService telemetry = new TelemetryService(registry, rawStore, evaluator,
                 protocolSupport, clock, props, mapper);
         DeviceService devices = new DeviceService(registry, protocolSupport);
         AggregationService aggregation = new AggregationService(registry, clock, props);
+        AvailabilityService availability = new AvailabilityService(registry, clock, props,
+                aggregation);
         return new Harness(clock, props, catalog, registry, rawStore, devices,
-                telemetry, aggregation, mapper);
+                telemetry, aggregation, availability, mapper);
     }
 }

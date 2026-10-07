@@ -68,11 +68,16 @@ public class AggregationService {
         return new WindowStats(type, values.size(), min, max, sum / values.size());
     }
 
-    /** 基于最后一次有效上报的事件时间判定离线，规则固定且可复现。 */
+    /**
+     * 在线判定口径（与可用性统计、机群概览共用同一规则，结论可复现）：
+     * 以最后一次**被接受**上报的接收时间为准——只要最近确实成功接入过有效上报
+     * 即在线，哪怕其事件时间远早于接收时间（乱序/滞后到达）也不判离线；
+     * 超过 offlineMillis 没有任何有效上报才离线。被拒绝的上报不影响结论。
+     */
     public boolean isOnline(DeviceState state, long atMillis) {
         long last;
         synchronized (state) {
-            last = state.lastValidEventTime();
+            last = state.lastValidIngestTime();
         }
         return last >= 0 && (atMillis - last) <= properties.getOfflineMillis();
     }
